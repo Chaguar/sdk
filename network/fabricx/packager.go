@@ -9,7 +9,6 @@ package fabricx
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	b64 "encoding/base64"
 	"errors"
 	"fmt"
@@ -25,19 +24,18 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// envelopeNonceSize matches the convention used when the invocation itself was built
-// (endorsement/fabricx.nonceSize); the two nonces are otherwise unrelated.
-const envelopeNonceSize = 24
-
 // NewTxPackager returns a TxPackager that assembles Fabric-X transaction envelopes.
 //
 // Signer is only required if the orderer enforces the channel Writers policy on submitted requests
 // (fabric-x-orderer: General.ClientSignatureVerificationRequired). The SDK cannot detect that
 // setting: an unsigned envelope sent to such an orderer is rejected by the router only after Submit
-// has already returned nil.
+// has already returned nil. If set, the signer must be the identity that built the invocation, as the
+// orderer checks the signature against the creator the TxID was derived from.
 //
-// With a nil signer the envelopes carry no creator and no signature, which saves a certificate and
-// a signature per transaction.
+// Either way, the envelope carries the invocation's nonce and creator, because the orderer requires
+// TxID == SHA256(nonce‖creator) on every request. With a nil signer the envelope carries no signature,
+// so nothing proves who submitted it: the creator is then only input to the TxID, and the nonce only
+// makes the TxID unique.
 func NewTxPackager(signer sdk.Signer) TxPackager {
 	return TxPackager{signer: signer}
 }
@@ -56,6 +54,8 @@ func (p TxPackager) PackageTx(end sdk.Endorsement) (*common.Envelope, error) {
 
 // CreateTx is an adaptation of protoutil.CreateSignedTx, tweaked to work with Fabric-X payloads.
 // It assembles an envelope from proposal and resps, signed by signer if it is not nil.
+// The envelope reuses the proposal's signature header, so its nonce and creator match the TxID
+// the endorsers signed. A non-nil signer must serialize to that creator.
 //
 // The proposal may come from fabricx.InvocationBuilder or be a Fabric SignedProposal
 // that remote endorsers parsed with fabric.Parse; either way the envelope is a
@@ -130,25 +130,6 @@ func CreateTx(proposal *peer.Proposal, signer sdk.Signer, resps ...*peer.Proposa
 		return nil, errors.New("can't marshal transaction payload")
 	}
 
-	shdr := &common.SignatureHeader{}
-	if signer != nil {
-		creator, err := signer.Serialize()
-		if err != nil {
-			return nil, fmt.Errorf("serialize signer: %w", err)
-		}
-		nonce := make([]byte, envelopeNonceSize)
-		if _, err := rand.Read(nonce); err != nil {
-			return nil, fmt.Errorf("read nonce: %w", err)
-		}
-		shdr.Creator, shdr.Nonce = creator, nonce
-	}
-	shdrBytes, err := proto.Marshal(shdr)
-	if err != nil {
-		return nil, fmt.Errorf("marshal signature header: %w", err)
-	}
-
-	// We can use classic Fabric proposals (see fabric.Parse) by replacing the
-	// ENDORSER_TRANSACTION with type MESSAGE. We remove the unused Extension.
 	hdr, err := protoutil.UnmarshalHeader(proposal.Header)
 	if err != nil {
 		return nil, err
@@ -157,6 +138,35 @@ func CreateTx(proposal *peer.Proposal, signer sdk.Signer, resps ...*peer.Proposa
 	if err != nil {
 		return nil, err
 	}
+
+	// The envelope reuses the proposal's signature header as it is. Endorsers sign over the TxID,
+	// so the TxID cannot change after endorsement, and the orderer requires the nonce and creator
+	// in the envelope to hash to it. Check that here, so a malformed proposal fails before submit,
+	// not silently at the orderer.
+	shdr, err := protoutil.UnmarshalSignatureHeader(hdr.SignatureHeader)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal proposal signature header: %w", err)
+	}
+	if len(shdr.Nonce) == 0 {
+		return nil, errors.New("proposal signature header has no nonce")
+	}
+	if err := protoutil.CheckTxID(chdr.TxId, shdr.Nonce, shdr.Creator); err != nil {
+		return nil, fmt.Errorf("proposal txid %q does not match its nonce and creator: %w", chdr.TxId, err)
+	}
+	if signer != nil {
+		// The orderer verifies the envelope signature against the creator in the header,
+		// so only the invocation's creator can sign the envelope.
+		creator, err := signer.Serialize()
+		if err != nil {
+			return nil, fmt.Errorf("serialize signer: %w", err)
+		}
+		if !bytes.Equal(creator, shdr.Creator) {
+			return nil, errors.New("signer is not the creator of the proposal: the envelope must be signed by the identity that built the invocation")
+		}
+	}
+
+	// We can use classic Fabric proposals (see fabric.Parse) by replacing the
+	// ENDORSER_TRANSACTION with type MESSAGE. We remove the unused Extension.
 	if chdr.Type != int32(common.HeaderType_MESSAGE) {
 		chdr.Type = int32(common.HeaderType_MESSAGE)
 		chdr.Extension = nil
@@ -169,7 +179,7 @@ func CreateTx(proposal *peer.Proposal, signer sdk.Signer, resps ...*peer.Proposa
 	payl := &common.Payload{
 		Header: &common.Header{
 			ChannelHeader:   hdr.ChannelHeader,
-			SignatureHeader: shdrBytes,
+			SignatureHeader: hdr.SignatureHeader,
 		},
 		Data: txBytes,
 	}

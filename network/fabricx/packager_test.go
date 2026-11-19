@@ -231,31 +231,152 @@ func TestCreateTx_TamperedPayload(t *testing.T) {
 	}
 }
 
-// TestCreateTx_Unsigned pins the unsigned shape, which deployments whose
-// orderer does not verify client signatures rely on.
-func TestCreateTx_Unsigned(t *testing.T) {
+// checkOrdererStructure mirrors the structure check fabric-x-orderer (v1.0.9+, #1330) runs on
+// every request in SigFilter.requestToSignedData, whether or not it verifies client signatures:
+// a non-empty nonce, TxId == ComputeTxID(nonce, creator), and a creator that parses as an
+// msppb.Identity. The SDK's integration test cannot catch a violation, because the committer
+// test node's mock orderer accepts any envelope.
+func checkOrdererStructure(env *common.Envelope) error {
+	payl, err := protoutil.UnmarshalPayload(env.Payload)
+	if err != nil {
+		return err
+	}
+	if payl.Header == nil || payl.Header.SignatureHeader == nil || payl.Header.ChannelHeader == nil {
+		return errors.New("missing header")
+	}
+	shdr, err := protoutil.UnmarshalSignatureHeader(payl.Header.SignatureHeader)
+	if err != nil {
+		return err
+	}
+	chdr, err := protoutil.UnmarshalChannelHeader(payl.Header.ChannelHeader)
+	if err != nil {
+		return err
+	}
+	if len(shdr.GetNonce()) == 0 {
+		return errors.New("missing nonce in signature header")
+	}
+	if err := protoutil.CheckTxID(chdr.GetTxId(), shdr.GetNonce(), shdr.GetCreator()); err != nil {
+		return err
+	}
+	_, err = protoutil.UnmarshalIdentity(shdr.Creator)
+	return err
+}
+
+// TestCreateTx_OrdererStructure: every envelope the SDK builds must pass the orderer's
+// structure check, signed or not, for local invocations and remote-endorser proposals alike.
+func TestCreateTx_OrdererStructure(t *testing.T) {
 	client, _ := newMSPSigner(t, "Org1MSP")
-	end := newEndorsement(t, client)
+	endorser, _ := newMSPSigner(t, "Org2MSP")
+	local := newEndorsement(t, client)
+
+	signedProp, err := nfab.NewSignedProposal(client, "mychannel", "myns", [][]byte{[]byte("fn")})
+	if err != nil {
+		t.Fatalf("NewSignedProposal: %v", err)
+	}
+	inv, err := efab.Parse(signedProp, time.Now())
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	resp, err := efabx.NewEndorsementBuilder(endorser).Endorse(inv, endorsement.Success(blocks.ReadWriteSet{
+		Writes: []blocks.KVWrite{{Key: "a", Value: []byte("va")}},
+	}, "", nil, nil))
+	if err != nil {
+		t.Fatalf("Endorse: %v", err)
+	}
+	remote := sdk.Endorsement{Proposal: inv.Proposal, Responses: []*peer.ProposalResponse{resp}}
 
 	for name, create := range map[string]func() (*common.Envelope, error){
-		"CreateTx":          func() (*common.Envelope, error) { return CreateTx(end.Proposal, nil, end.Responses...) },
-		"NewTxPackager nil": func() (*common.Envelope, error) { return NewTxPackager(nil).PackageTx(end) },
-		"zero TxPackager":   func() (*common.Envelope, error) { return TxPackager{}.PackageTx(end) },
+		"local signed":      func() (*common.Envelope, error) { return NewTxPackager(client).PackageTx(local) },
+		"local unsigned":    func() (*common.Envelope, error) { return NewTxPackager(nil).PackageTx(local) },
+		"zero TxPackager":   func() (*common.Envelope, error) { return TxPackager{}.PackageTx(local) },
+		"remote signed":     func() (*common.Envelope, error) { return NewTxPackager(client).PackageTx(remote) },
+		"remote unsigned":   func() (*common.Envelope, error) { return NewTxPackager(nil).PackageTx(remote) },
+		"CreateTx unsigned": func() (*common.Envelope, error) { return CreateTx(local.Proposal, nil, local.Responses...) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			env, err := create()
 			if err != nil {
 				t.Fatalf("create: %v", err)
 			}
-			if len(env.Signature) != 0 {
-				t.Errorf("expected no signature, got %d bytes", len(env.Signature))
+			if err := checkOrdererStructure(env); err != nil {
+				t.Errorf("orderer would reject the envelope: %v", err)
 			}
-			_, shdr := unpack(t, env)
-			if len(shdr.Creator) != 0 {
-				t.Errorf("expected no creator, got %d bytes", len(shdr.Creator))
-			}
-			if len(shdr.Nonce) != 0 {
-				t.Errorf("expected no nonce either, got %d bytes", len(shdr.Nonce))
+		})
+	}
+}
+
+// TestCreateTx_Unsigned pins the unsigned shape: no signature, and the proposal's
+// signature header carried over unchanged, since the TxID is derived from it.
+func TestCreateTx_Unsigned(t *testing.T) {
+	client, _ := newMSPSigner(t, "Org1MSP")
+	end := newEndorsement(t, client)
+
+	env, err := NewTxPackager(nil).PackageTx(end)
+	if err != nil {
+		t.Fatalf("PackageTx: %v", err)
+	}
+	if len(env.Signature) != 0 {
+		t.Errorf("expected no signature, got %d bytes", len(env.Signature))
+	}
+	payl, _ := unpack(t, env)
+	hdr, err := protoutil.UnmarshalHeader(end.Proposal.Header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(payl.Header.SignatureHeader, hdr.SignatureHeader) {
+		t.Error("envelope signature header differs from the proposal's")
+	}
+}
+
+// TestCreateTx_SignerNotCreator: the orderer verifies the signature against the creator
+// in the header, so another identity's signature would be rejected there; fail early.
+func TestCreateTx_SignerNotCreator(t *testing.T) {
+	client, _ := newMSPSigner(t, "Org1MSP")
+	other, _ := newMSPSigner(t, "Org1MSP")
+	end := newEndorsement(t, client)
+
+	if _, err := CreateTx(end.Proposal, other, end.Responses...); err == nil || !strings.Contains(err.Error(), "not the creator") {
+		t.Errorf("expected a creator mismatch error, got %v", err)
+	}
+}
+
+// TestCreateTx_MalformedProposal: a proposal whose TxID does not derive from its
+// signature header would be rejected by the orderer after Submit returned nil.
+func TestCreateTx_MalformedProposal(t *testing.T) {
+	client, _ := newMSPSigner(t, "Org1MSP")
+	end := newEndorsement(t, client)
+
+	withShdr := func(shdr *common.SignatureHeader) *peer.Proposal {
+		hdr, err := protoutil.UnmarshalHeader(end.Proposal.Header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hdr.SignatureHeader = protoutil.MarshalOrPanic(shdr)
+		return &peer.Proposal{Header: protoutil.MarshalOrPanic(hdr), Payload: end.Proposal.Payload}
+	}
+	hdr, err := protoutil.UnmarshalHeader(end.Proposal.Header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig, err := protoutil.UnmarshalSignatureHeader(hdr.SignatureHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, tc := range map[string]struct {
+		shdr *common.SignatureHeader
+		want string
+	}{
+		"empty header":  {&common.SignatureHeader{}, "no nonce"},
+		"other nonce":   {&common.SignatureHeader{Nonce: []byte("other"), Creator: orig.Creator}, "does not match"},
+		"other creator": {&common.SignatureHeader{Nonce: orig.Nonce, Creator: []byte("other")}, "does not match"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, signer := range []sdk.Signer{nil, client} {
+				_, err := CreateTx(withShdr(tc.shdr), signer, end.Responses...)
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Errorf("signer %v: expected %q error, got %v", signer != nil, tc.want, err)
+				}
 			}
 		})
 	}
