@@ -8,7 +8,6 @@ package fabricx
 
 import (
 	"crypto/rand"
-	"errors"
 	"fmt"
 
 	commonpb "github.com/hyperledger/fabric-protos-go-apiv2/common"
@@ -26,12 +25,14 @@ var _ endorsement.InvocationBuilder = InvocationBuilder{}
 const nonceSize = 24
 
 // NewInvocationBuilder returns an InvocationBuilder that produces header-only
-// Fabric-X invocations.
+// Fabric-X invocations. signer may be nil, for anonymous invocations; see
+// NewInvocation.
 func NewInvocationBuilder(signer sdk.Signer) InvocationBuilder {
 	return InvocationBuilder{signer: signer}
 }
 
-// InvocationBuilder creates Fabric-X-format invocations from a signer.
+// InvocationBuilder creates Fabric-X-format invocations, optionally on behalf
+// of a signer.
 type InvocationBuilder struct {
 	signer sdk.Signer
 }
@@ -56,14 +57,18 @@ type InvocationBuilder struct {
 // The result is not a proposal an endorser can parse. fabric.Parse reads
 // the proposal payload, deliberately absent here, so this serves the local
 // submit path rather than a request to a remote endorser.
+//
+// With a nil signer the invocation has no creator, and the transaction id is
+// derived from the nonce alone. Its envelope can then only be submitted
+// unsigned, to an orderer that does not verify client signatures
+// (General.ClientSignatureVerificationRequired=false).
 func (b InvocationBuilder) NewInvocation(channel, namespace, chaincodeVersion string, nsVersion uint64, args [][]byte) (endorsement.Invocation, error) {
-	if b.signer == nil {
-		return endorsement.Invocation{}, errors.New("nil signer")
-	}
-
-	creator, err := b.signer.Serialize()
-	if err != nil {
-		return endorsement.Invocation{}, err
+	var creator []byte
+	if b.signer != nil {
+		var err error
+		if creator, err = b.signer.Serialize(); err != nil {
+			return endorsement.Invocation{}, err
+		}
 	}
 
 	nonce := make([]byte, nonceSize)
