@@ -284,10 +284,12 @@ func TestCreateTx_OrdererStructure(t *testing.T) {
 		t.Fatalf("Endorse: %v", err)
 	}
 	remote := sdk.Endorsement{Proposal: inv.Proposal, Responses: []*peer.ProposalResponse{resp}}
+	anonymous := newEndorsement(t, nil)
 
 	for name, create := range map[string]func() (*common.Envelope, error){
 		"local signed":      func() (*common.Envelope, error) { return NewTxPackager(client).PackageTx(local) },
 		"local unsigned":    func() (*common.Envelope, error) { return NewTxPackager(nil).PackageTx(local) },
+		"anonymous":         func() (*common.Envelope, error) { return NewTxPackager(nil).PackageTx(anonymous) },
 		"zero TxPackager":   func() (*common.Envelope, error) { return TxPackager{}.PackageTx(local) },
 		"remote signed":     func() (*common.Envelope, error) { return NewTxPackager(client).PackageTx(remote) },
 		"remote unsigned":   func() (*common.Envelope, error) { return NewTxPackager(nil).PackageTx(remote) },
@@ -336,6 +338,17 @@ func TestCreateTx_SignerNotCreator(t *testing.T) {
 	end := newEndorsement(t, client)
 
 	if _, err := CreateTx(end.Proposal, other, end.Responses...); err == nil || !strings.Contains(err.Error(), "not the creator") {
+		t.Errorf("expected a creator mismatch error, got %v", err)
+	}
+}
+
+// TestCreateTx_SignedAnonymous: an anonymous invocation has no creator to verify a
+// signature against, so it can only be packaged unsigned.
+func TestCreateTx_SignedAnonymous(t *testing.T) {
+	client, _ := newMSPSigner(t, "Org1MSP")
+	end := newEndorsement(t, nil)
+
+	if _, err := CreateTx(end.Proposal, client, end.Responses...); err == nil || !strings.Contains(err.Error(), "not the creator") {
 		t.Errorf("expected a creator mismatch error, got %v", err)
 	}
 }

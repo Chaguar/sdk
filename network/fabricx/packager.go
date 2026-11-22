@@ -35,7 +35,8 @@ import (
 // Either way, the envelope carries the invocation's nonce and creator, because the orderer requires
 // TxID == SHA256(nonce‖creator) on every request. With a nil signer the envelope carries no signature,
 // so nothing proves who submitted it: the creator is then only input to the TxID, and the nonce only
-// makes the TxID unique.
+// makes the TxID unique. An invocation built without a signer (fabricx.NewInvocationBuilder(nil))
+// has an empty creator, so the envelope carries no identity at all; it can only be packaged unsigned.
 func NewTxPackager(signer sdk.Signer) TxPackager {
 	return TxPackager{signer: signer}
 }

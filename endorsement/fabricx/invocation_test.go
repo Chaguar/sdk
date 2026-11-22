@@ -156,15 +156,29 @@ func TestNewInvocation_SerializeError(t *testing.T) {
 	}
 }
 
+// TestNewInvocation_NilSigner: without a signer the invocation is anonymous. It has
+// no creator, and its TxID is derived from the nonce alone, so it still passes the
+// orderer's TxID check.
 func TestNewInvocation_NilSigner(t *testing.T) {
-	for _, b := range []InvocationBuilder{NewInvocationBuilder(nil), {}} {
-		_, err := b.NewInvocation("mychannel", "myns", "v1", 0, nil)
-		if err == nil {
-			t.Fatal("expected an error for a nil signer")
-		}
-		if err.Error() != "nil signer" {
-			t.Errorf("unexpected error: %v", err)
-		}
+	inv, err := NewInvocationBuilder(nil).NewInvocation("mychannel", "myns", "v1", 0, nil)
+	if err != nil {
+		t.Fatalf("NewInvocation: %v", err)
+	}
+	if len(inv.Creator) != 0 {
+		t.Errorf("expected no creator, got %d bytes", len(inv.Creator))
+	}
+	if len(inv.Nonce) != nonceSize {
+		t.Errorf("expected a %d byte nonce, got %d", nonceSize, len(inv.Nonce))
+	}
+	if want := protoutil.ComputeTxID(inv.Nonce, nil); inv.TxID != want {
+		t.Errorf("tx id not derived from the nonce alone: got %q, want %q", inv.TxID, want)
+	}
+	chdr, shdr := headers(t, inv)
+	if chdr.TxId != inv.TxID {
+		t.Errorf("channel header tx id %q does not match invocation %q", chdr.TxId, inv.TxID)
+	}
+	if len(shdr.Creator) != 0 || !bytes.Equal(shdr.Nonce, inv.Nonce) {
+		t.Errorf("signature header must carry the nonce and no creator: %v", shdr)
 	}
 }
 
