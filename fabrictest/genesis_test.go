@@ -91,7 +91,7 @@ func seekSpecified(num uint64) *orderer.SeekPosition {
 func TestGenesisBlock_DeliveredFromZero(t *testing.T) {
 	for _, networkType := range networkTypes {
 		t.Run(networkType, func(t *testing.T) {
-			n, err := Start(t.Context(), "basic", networkType, Config{}, nil)
+			n, err := Start(t.Context(), networkType, Config{})
 			if err != nil {
 				t.Fatalf("Start: %v", err)
 			}
@@ -126,7 +126,7 @@ func TestGenesisBlock_DeliveredFromZero(t *testing.T) {
 func TestGenesisBlock_NotReportedAsTransaction(t *testing.T) {
 	for _, networkType := range networkTypes {
 		t.Run(networkType, func(t *testing.T) {
-			n, err := Start(t.Context(), "basic", networkType, Config{}, nil)
+			n, err := Start(t.Context(), networkType, Config{})
 			if err != nil {
 				t.Fatalf("Start: %v", err)
 			}
@@ -178,7 +178,7 @@ func TestGenesisBlock_NotReportedAsTransaction(t *testing.T) {
 // TestDeliver_SeekNewestStartsAtTip guards the tip calculation. Deriving it from
 // len(existing) skips past the newest block once genesis occupies position 0.
 func TestDeliver_SeekNewestStartsAtTip(t *testing.T) {
-	n, err := Start(t.Context(), "basic", "fabric-x", Config{}, nil)
+	n, err := Start(t.Context(), "fabric-x", Config{})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}

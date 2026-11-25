@@ -15,16 +15,10 @@ import (
 	"github.com/hyperledger/fabric-protos-go-apiv2/orderer"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-
-	"github.com/hyperledger/fabric-x-sdk/state"
 )
 
 func TestRevert_NextBlockReusesNumber(t *testing.T) {
-	ext, err := state.NewWriteDB("mychannel", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	n, err := Start(t.Context(), "basic", "fabric-x", Config{}, ext)
+	n, err := Start(t.Context(), "fabric-x", Config{})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -34,7 +28,7 @@ func TestRevert_NextBlockReusesNumber(t *testing.T) {
 		}
 	}
 	// blocks 0..3 exist; rewind to 1.
-	_, newBlocks := n.ledger.subscribe()
+	_, _, newBlocks := n.ledger.subscribe()
 	if err := n.Revert(t.Context(), 1); err != nil {
 		t.Fatalf("Revert: %v", err)
 	}
@@ -58,24 +52,10 @@ func TestRevert_NextBlockReusesNumber(t *testing.T) {
 	}
 }
 
-func TestRevert_RequiresExternalState(t *testing.T) {
-	n, err := Start(t.Context(), "basic", "fabric-x", Config{}, nil)
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if err := n.Revert(t.Context(), 0); err == nil {
-		t.Error("Revert without external state: want error")
-	}
-}
-
-// A different transaction can take a reverted block's number: fabrictest keeps
-// no world state of its own that would reject the replayed writes.
+// A different transaction can take a reverted block's number, and the world
+// state no longer holds the reverted block's writes.
 func TestRevert_ReplacesBlockWithDifferentTx(t *testing.T) {
-	ext, err := state.NewWriteDB("mychannel", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	n, err := Start(t.Context(), "basic", "fabric-x", Config{}, ext)
+	n, err := Start(t.Context(), "fabric-x", Config{})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -85,7 +65,7 @@ func TestRevert_ReplacesBlockWithDifferentTx(t *testing.T) {
 	}
 	t.Cleanup(func() { conn.Close() }) //nolint:errcheck,gosec // Best-effort test cleanup.
 	client := orderer.NewAtomicBroadcastClient(conn)
-	_, newBlocks := n.ledger.subscribe()
+	_, _, newBlocks := n.ledger.subscribe()
 
 	commit := func(txID string) *common.Block {
 		t.Helper()
@@ -114,7 +94,13 @@ func TestRevert_ReplacesBlockWithDifferentTx(t *testing.T) {
 	if err := n.Revert(t.Context(), 0); err != nil {
 		t.Fatalf("Revert: %v", err)
 	}
+	if w, err := n.ledger.db.Get("basic", "k"); err != nil || w != nil {
+		t.Fatalf("world state after revert: got %+v, %v; want nil", w, err)
+	}
 	if bl := commit("b"); bl.Header.Number != 1 {
 		t.Fatalf("block after revert = %d, want 1", bl.Header.Number)
+	}
+	if w, err := n.ledger.db.Get("basic", "k"); err != nil || w == nil || w.TxID != "b" {
+		t.Fatalf("world state after replacement: got %+v, %v; want tx b", w, err)
 	}
 }

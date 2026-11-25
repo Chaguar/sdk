@@ -316,3 +316,38 @@ var _ KVS = (*VersionedDB)(nil)
 func (db *VersionedDB) Close() error {
 	return db.backend.Close()
 }
+
+// RevertibleDB is a VersionedDB that can roll back. For dev and test only, on a
+// single node that also owns the ledger (as fabrictest does): a real committer
+// never rolls back.
+type RevertibleDB struct{ *VersionedDB }
+
+// NewRevertibleDB returns a RevertibleDB on a SQLite database, like NewWriteDB.
+func NewRevertibleDB(channel, connStr string) (*RevertibleDB, error) {
+	db, err := NewWriteDB(channel, connStr)
+	if err != nil {
+		return nil, err
+	}
+	return &RevertibleDB{db}, nil
+}
+
+// RevertToBlock drops every write after block, so block becomes the last committed block.
+func (db *RevertibleDB) RevertToBlock(block uint64) error {
+	ctx := context.Background()
+	sqlTx, err := db.backend.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin revert: %w", err)
+	}
+	defer sqlTx.Rollback() //nolint:errcheck
+
+	if _, err := sqlTx.ExecContext(ctx, "DELETE FROM worldstate WHERE channel = $1 AND version_block > $2", db.channel, block); err != nil {
+		return fmt.Errorf("revert world state: %w", err)
+	}
+	if _, err := sqlTx.ExecContext(ctx, "UPDATE channel_progress SET last_block = $2 WHERE channel = $1 AND last_block > $2", db.channel, block); err != nil {
+		return fmt.Errorf("revert last block: %w", err)
+	}
+	if err := sqlTx.Commit(); err != nil {
+		return fmt.Errorf("commit revert: %w", err)
+	}
+	return nil
+}

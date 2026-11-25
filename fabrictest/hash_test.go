@@ -12,8 +12,6 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric-x-common/protoutil"
-
-	"github.com/hyperledger/fabric-x-sdk/state"
 )
 
 // TestBlockHeader_ChainsByPreviousHash pins the property a client walking the chain
@@ -22,7 +20,7 @@ import (
 func TestBlockHeader_ChainsByPreviousHash(t *testing.T) {
 	for _, networkType := range networkTypes {
 		t.Run(networkType, func(t *testing.T) {
-			n, err := Start(t.Context(), "basic", networkType, Config{}, nil)
+			n, err := Start(t.Context(), networkType, Config{})
 			if err != nil {
 				t.Fatalf("Start: %v", err)
 			}
@@ -85,13 +83,13 @@ func TestBlockHeader_DataHashCoversData(t *testing.T) {
 // TestChainInfo_MatchesDeliveredHeaders pins that the hashes GetBlockchainInfo reports
 // are the same ones in the delivered headers — a client comparing the two must agree.
 func TestChainInfo_MatchesDeliveredHeaders(t *testing.T) {
-	n, err := Start(t.Context(), "basic", "fabric-x", Config{}, nil)
+	n, err := Start(t.Context(), "fabric-x", Config{})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
 	// Genesis is still the tip: there is no block before it.
-	if _, _, prev := n.ledger.chainInfo(); len(prev) != 0 {
+	if prev := n.ledger.chainInfo().PreviousBlockHash; len(prev) != 0 {
 		t.Errorf("PreviousBlockHash at genesis: want empty, got %x", prev)
 	}
 
@@ -103,26 +101,22 @@ func TestChainInfo_MatchesDeliveredHeaders(t *testing.T) {
 	genesis := recvBlock(t, stream)
 	tip := recvBlock(t, stream)
 
-	height, currentHash, previousHash := n.ledger.chainInfo()
-	if height != 2 {
-		t.Errorf("height: got %d, want 2", height)
+	info := n.ledger.chainInfo()
+	if info.Height != 2 {
+		t.Errorf("height: got %d, want 2", info.Height)
 	}
-	if want := protoutil.BlockHeaderHash(tip.Header); !bytes.Equal(currentHash, want) {
-		t.Errorf("CurrentBlockHash: got %x, want %x", currentHash, want)
+	if want := protoutil.BlockHeaderHash(tip.Header); !bytes.Equal(info.CurrentBlockHash, want) {
+		t.Errorf("CurrentBlockHash: got %x, want %x", info.CurrentBlockHash, want)
 	}
-	if want := protoutil.BlockHeaderHash(genesis.Header); !bytes.Equal(previousHash, want) {
-		t.Errorf("PreviousBlockHash: got %x, want %x", previousHash, want)
+	if want := protoutil.BlockHeaderHash(genesis.Header); !bytes.Equal(info.PreviousBlockHash, want) {
+		t.Errorf("PreviousBlockHash: got %x, want %x", info.PreviousBlockHash, want)
 	}
 }
 
 // TestRevert_RechainsOntoNewTip pins that a block cut after a revert chains onto the
 // block it actually follows, not onto the discarded fork.
 func TestRevert_RechainsOntoNewTip(t *testing.T) {
-	ext, err := state.NewWriteDB("mychannel", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	n, err := Start(t.Context(), "basic", "fabric-x", Config{}, ext)
+	n, err := Start(t.Context(), "fabric-x", Config{})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}

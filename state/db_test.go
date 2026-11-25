@@ -386,3 +386,42 @@ func TestSnapshotAt_FutureBlockIsCapped(t *testing.T) {
 		t.Errorf("snapshot read %q, want v1", got)
 	}
 }
+
+func TestRevertToBlock(t *testing.T) {
+	db := &RevertibleDB{newTestDB(t)}
+	ctx := context.Background()
+	for block := uint64(1); block <= 3; block++ {
+		mustWrite(t, db.VersionedDB, "ns", "k", block, 0, fmt.Appendf(nil, "v%d", block))
+	}
+	mustWrite(t, db.VersionedDB, "ns", "later", 3, 1, []byte("x"))
+
+	if err := db.RevertToBlock(1); err != nil {
+		t.Fatalf("RevertToBlock: %v", err)
+	}
+	if got, _ := db.BlockNumber(ctx); got != 1 {
+		t.Errorf("BlockNumber: got %d, want 1", got)
+	}
+	if w, _ := db.Get("ns", "k"); w == nil || string(w.Value) != "v1" || w.BlockNum != 1 {
+		t.Errorf("Get k: got %+v, want v1 at block 1", w)
+	}
+	if w, _ := db.Get("ns", "later"); w != nil {
+		t.Errorf("Get later: got %+v, want nil", w)
+	}
+	if w, _ := db.GetAt("ns", "k", 3); w == nil || string(w.Value) != "v1" {
+		t.Errorf("GetAt k at 3: got %+v, want v1", w)
+	}
+
+	// The chain continues from block 2, with versions following on from block 1.
+	mustWrite(t, db.VersionedDB, "ns", "k", 2, 0, []byte("v2b"))
+	if w, _ := db.Get("ns", "k"); w == nil || string(w.Value) != "v2b" || w.Version != 1 {
+		t.Errorf("Get k after rewrite: got %+v, want v2b at version 1", w)
+	}
+
+	// Reverting beyond the last block changes nothing.
+	if err := db.RevertToBlock(5); err != nil {
+		t.Fatalf("RevertToBlock: %v", err)
+	}
+	if got, _ := db.BlockNumber(ctx); got != 2 {
+		t.Errorf("BlockNumber after RevertToBlock(5): got %d, want 2", got)
+	}
+}
