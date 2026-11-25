@@ -8,25 +8,12 @@ package fabrictest
 
 import (
 	"context"
-	"errors"
 	"io"
 	"time"
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric-protos-go-apiv2/orderer"
 )
-
-// Config controls the network characteristics and batching behavior of the test orderer.
-type Config struct {
-	// BlockCutTime is the maximum time to wait before cutting a block (0 = cut immediately).
-	BlockCutTime time.Duration
-	// MaxTxPerBlock is the maximum number of transactions per block (0 = no limit).
-	MaxTxPerBlock int
-	// OrdererPort is the port of the orderer (0 = random)
-	OrdererPort int
-	// PeerPort is the port of the peer (0 = random)
-	PeerPort int
-}
 
 func newTestOrderer(l *ledger, cfg Config) *testOrderer {
 	o := &testOrderer{
@@ -44,8 +31,10 @@ func newTestOrderer(l *ledger, cfg Config) *testOrderer {
 }
 
 // testOrderer receives transaction envelopes and cuts blocks.
-// Contrary to a normal orderer, it does MVCC validation in place.
+// Contrary to a normal orderer, it does MVCC validation in place and stores the
+// blocks on the ledger directly, so it has no Deliver.
 type testOrderer struct {
+	orderer.UnimplementedAtomicBroadcastServer
 	ledger   *ledger
 	inCh     chan *common.Envelope
 	cutCh    chan chan error
@@ -191,10 +180,4 @@ func (o *testOrderer) batchingLoop() {
 			return
 		}
 	}
-}
-
-// Deliver delivers blocks to peers. We skip that part; we let the orderer do the
-// validations and store the blocks on the ledger directly.
-func (o *testOrderer) Deliver(orderer.AtomicBroadcast_DeliverServer) error {
-	return errors.New("not implemented")
 }

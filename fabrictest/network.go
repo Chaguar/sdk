@@ -4,20 +4,18 @@ Copyright IBM Corp. All Rights Reserved.
 SPDX-License-Identifier: Apache-2.0
 */
 
-// package testfabric provides a mock implementation of an orderer and a peer.
-// It creates one transaction per block and does some very basic MVCC checks.
-// The Network can be embedded in an integration test by using the OrdererAddr
-// and PeerAddr.
 package fabrictest
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
+	"time"
 
-	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric-protos-go-apiv2/orderer"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/hyperledger/fabric-x-common/api/committerpb"
@@ -30,8 +28,24 @@ import (
 	"github.com/hyperledger/fabric-x-sdk/state"
 )
 
+// Config configures the network that Start runs: block cutting, ports and the world state db.
+type Config struct {
+	// BlockCutTime is the maximum time to wait before cutting a block (0 = cut immediately).
+	BlockCutTime time.Duration
+	// MaxTxPerBlock is the maximum number of transactions per block (0 = no limit).
+	MaxTxPerBlock int
+	// OrdererPort is the port of the orderer (0 = random)
+	OrdererPort int
+	// PeerPort is the port of the peer (0 = random)
+	PeerPort int
+	// DB is the SQLite connection string of the world state ("" = in memory).
+	// With a stored db, a restarted network continues the chain where the last
+	// one stopped. Blocks from before the restart are not available.
+	DB string
+}
+
 // Network is a wrapper for a minimal mock Fabric.
-// Embed Network in a test and use PeerAddr and OrdererAddr as endpoints.
+// Embed Network in a test and use PeerPort and OrdererPort as endpoints on localhost.
 type Network struct {
 	PeerPort    int
 	OrdererPort int
@@ -39,55 +53,46 @@ type Network struct {
 	pSrv        *grpc.Server
 	orderer     *testOrderer
 	ledger      *ledger
+	stopOnce    sync.Once
 }
 
-// TxParser extracts read-write sets from transaction envelopes.
-// Fabric and fabric-x have the same envelope, but different payloads.
-// The TxParser knows how to process them.
-type TxParser interface {
-	Parse(namespace string, env *common.Envelope) (blocks.ReadWriteSet, string, error)
-}
-
-// Start creates grpc servers for the peer and orderer on random ports on localhost.
-// The servers are stopped when ctx is cancelled.
-func Start(ctx context.Context, namespace, networkType string, cfg Config, db1 blocks.RecordGetter) (*Network, error) {
+// Start creates grpc servers for the peer and orderer on localhost, on the ports
+// in cfg (random by default). The servers are stopped when ctx is cancelled.
+func Start(ctx context.Context, networkType string, cfg Config) (*Network, error) {
 	logger := sdk.NewStdLogger("fabrictest")
-
-	// Read MVCC conflicts from db1 if provided (read-only).
-	// If not, create our own in-memory state db.
-	var db *state.VersionedDB
-	rg := db1
-	if db1 == nil {
-		var err error
-		db, err = state.NewWriteDB("mychannel", ":memory:")
-		if err != nil {
-			return nil, err
-		}
-		rg = db
-	}
 
 	// some specifics for either fabric or fabric-x
 	var parser blocks.BlockParser
-	var validator *blocks.MVCCValidator
+	var newValidator func(blocks.RecordGetter, sdk.Logger) *blocks.MVCCValidator
 
 	switch networkType {
 	case "fabric":
-		parser = fabric.NewBlockParser(logger)
-		validator = fabric.NewMVCCValidator(rg, logger)
+		parser, newValidator = fabric.NewBlockParser(logger), fabric.NewMVCCValidator
 	case "fabric-x":
-		parser = fabricx.NewBlockParser(logger)
-		validator = fabricx.NewMVCCValidator(rg, logger)
+		parser, newValidator = fabricx.NewBlockParser(logger), fabricx.NewMVCCValidator
 	default:
 		return nil, errors.New("networkType must be fabric or fabric-x")
 	}
 
-	// listen on random local port
-	ordererLis, oPort, err := listen(cfg.OrdererPort)
+	db, err := state.NewRevertibleDB("mychannel", cmp.Or(cfg.DB, ":memory:"))
 	if err != nil {
 		return nil, err
 	}
-	peerLis, pPort, err := listen(cfg.OrdererPort)
+	l, err := newLedger(ctx, db, parser, newValidator(db, logger))
 	if err != nil {
+		db.Close() //nolint:errcheck,gosec // Preserve the ledger error.
+		return nil, err
+	}
+
+	ordererLis, oPort, err := listen(cfg.OrdererPort)
+	if err != nil {
+		l.close()
+		return nil, err
+	}
+	peerLis, pPort, err := listen(cfg.PeerPort)
+	if err != nil {
+		ordererLis.Close() //nolint:errcheck,gosec // Preserve the listen error.
+		l.close()
 		return nil, err
 	}
 
@@ -99,7 +104,7 @@ func Start(ctx context.Context, namespace, networkType string, cfg Config, db1 b
 	}
 
 	// ledger ties it together by storing blocks and the world state db
-	n.ledger = newLedger(db, parser, validator)
+	n.ledger = l
 	n.orderer = newTestOrderer(n.ledger, cfg)
 
 	// grpc endpoints
@@ -150,19 +155,21 @@ func (n *Network) CutBlock(ctx context.Context) error {
 	return n.orderer.cutBlock(ctx)
 }
 
-// Revert truncates the chain so num is the last block; the next block cut takes
-// number num+1. Pending transactions not yet in a block are dropped. Open Deliver
-// streams continue with the new block num+1, so consumers must rewind their own
-// state to num. Requires db1 passed to Start, since fabrictest's own world state
-// cannot be rewound.
+// Revert truncates the chain and world state so num is the last block; the next
+// block cut takes number num+1. Pending transactions not yet in a block are
+// dropped. Open Deliver streams continue with the new block num+1, so consumers
+// must rewind their own state to num.
 func (n *Network) Revert(ctx context.Context, num uint64) error {
 	return n.orderer.revert(ctx, num)
 }
 
-// Stop gracefully shuts down the orderer and peer gRPC servers.
+// Stop shuts down the orderer and peer gRPC servers. It is safe to call more
+// than once, e.g. explicitly and again when ctx is cancelled.
 func (n *Network) Stop() {
-	n.oSrv.Stop()
-	n.pSrv.Stop()
-	n.orderer.stop()
-	n.ledger.close()
+	n.stopOnce.Do(func() {
+		n.oSrv.Stop()
+		n.pSrv.Stop()
+		n.orderer.stop()
+		n.ledger.close()
+	})
 }

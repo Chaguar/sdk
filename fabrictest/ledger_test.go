@@ -21,12 +21,15 @@ import (
 // newTestLedger builds a fabric-x ledger backed by an in-memory database.
 func newTestLedger(t *testing.T) *ledger {
 	t.Helper()
-	db, err := state.NewWriteDB("mychannel", ":memory:")
+	db, err := state.NewRevertibleDB("mychannel", ":memory:")
 	if err != nil {
 		t.Fatalf("create db: %v", err)
 	}
 	logger := sdk.NewStdLogger("fabrictest")
-	l := newLedger(db, fabricx.NewBlockParser(logger), fabricx.NewMVCCValidator(db, logger))
+	l, err := newLedger(t.Context(), db, fabricx.NewBlockParser(logger), fabricx.NewMVCCValidator(db, logger))
+	if err != nil {
+		t.Fatalf("newLedger: %v", err)
+	}
 	t.Cleanup(l.close)
 	return l
 }

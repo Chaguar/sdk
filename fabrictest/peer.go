@@ -20,7 +20,6 @@ import (
 	"github.com/hyperledger/fabric-x-common/protoutil"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 	"github.com/hyperledger/fabric-x-sdk/endorsement/fabric"
-	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -28,39 +27,49 @@ import (
 func newTestPeer(ledger *ledger) *testPeer {
 	return &testPeer{
 		ledger:  ledger,
-		builder: fabric.NewEndorsementBuilder(&testSigner{}),
+		builder: fabric.NewEndorsementBuilder(MockSigner{}),
 	}
 }
 
+// testPeer serves Deliver, qscc GetChainInfo and parts of the Fabric-X sidecar.
+// Anything else returns codes.Unimplemented.
 type testPeer struct {
+	peer.UnimplementedDeliverServer
+	peer.UnimplementedEndorserServer
+	committerpb.UnimplementedSidecarServiceServer
 	ledger  *ledger
 	builder endorsement.Builder
-	committerpb.UnimplementedSidecarServiceServer
 }
 
-// parseStartBlock extracts the requested start block number from the seek envelope.
-// Returns 0 (oldest) on any parse error, math.MaxUint64 for SeekNewest (handled by caller).
-func parseStartBlock(env *common.Envelope) (uint64, bool) {
+type startKind int
+
+const (
+	startOldest startKind = iota
+	startSpecified
+	startNewest
+)
+
+// parseStartBlock extracts the requested start position from the seek envelope.
+// The number is only set for startSpecified. Parse errors count as startOldest.
+func parseStartBlock(env *common.Envelope) (uint64, startKind) {
 	pl := &common.Payload{}
 	if err := proto.Unmarshal(env.Payload, pl); err != nil {
-		return 0, false
+		return 0, startOldest
 	}
 	si := &orderer.SeekInfo{}
 	if err := proto.Unmarshal(pl.Data, si); err != nil {
-		return 0, false
+		return 0, startOldest
 	}
 	if si.Start == nil {
-		return 0, false
+		return 0, startOldest
 	}
 	switch t := si.Start.Type.(type) {
-	case *orderer.SeekPosition_Oldest:
-		return 0, false
 	case *orderer.SeekPosition_Specified:
-		return t.Specified.Number, false
+		return t.Specified.Number, startSpecified
 	case *orderer.SeekPosition_Newest:
-		return 0, true // caller uses current height
+		return 0, startNewest
 	default:
-		return 0, false
+		return 0, startOldest
 	}
 }
 
@@ -73,15 +82,26 @@ func (p *testPeer) Deliver(stream peer.Deliver_DeliverServer) error {
 		return err
 	}
 
-	startBlock, newest := parseStartBlock(env)
+	startBlock, kind := parseStartBlock(env)
+
+	// After a restart, blocks before the first one held are not available.
+	if kind == startSpecified && startBlock < p.ledger.firstHeld() {
+		return stream.Send(&peer.DeliverResponse{
+			Type: &peer.DeliverResponse_Status{Status: common.Status_NOT_FOUND},
+		})
+	}
 
 	// Register as a subscriber and get a snapshot of already-committed blocks.
 	// Both happen under the ledger lock so no blocks are lost between the two.
-	existing, sub := p.ledger.subscribe()
+	existing, first, sub := p.ledger.subscribe()
 
-	// For SeekNewest, start from the current tip (no historical replay).
-	if newest {
-		startBlock = existing[len(existing)-1].Header.Number
+	// Oldest starts at 0, which the filter below turns into the first block held.
+	if kind == startNewest {
+		// The current tip, or the next block if none is held since a restart.
+		startBlock = first
+		if len(existing) > 0 {
+			startBlock = existing[len(existing)-1].Header.Number
+		}
 	}
 
 	// Replay historical blocks starting from startBlock.
@@ -113,20 +133,6 @@ func (p *testPeer) Deliver(stream peer.Deliver_DeliverServer) error {
 	return nil
 }
 
-// DeliverFiltered first requires an Envelope of type ab.DELIVER_SEEK_INFO with
-// Payload data as a marshaled orderer.SeekInfo message,
-// then a stream of **filtered** block replies is received
-func (p *testPeer) DeliverFiltered(peer.Deliver_DeliverFilteredServer) error {
-	return errors.New("not implemented")
-}
-
-// DeliverWithPrivateData first requires an Envelope of type ab.DELIVER_SEEK_INFO with
-// Payload data as a marshaled orderer.SeekInfo message,
-// then a stream of block and private data replies is received
-func (p *testPeer) DeliverWithPrivateData(grpc.BidiStreamingServer[common.Envelope, peer.DeliverResponse]) error {
-	return errors.New("not implemented")
-}
-
 // -- Fabric
 
 // ProcessProposal implements the Fabric Endorser API for processing proposals.
@@ -146,14 +152,9 @@ func (p *testPeer) ProcessProposal(ctx context.Context, prop *peer.SignedProposa
 	// Return ProposalResponse with the ledger height and the real chain-tip hashes as
 	// payload, just as a Fabric peer would respond. The hashes are the ones in the
 	// delivered blocks' headers, so a client can match this reply against them.
-	height, currentHash, previousHash := p.ledger.chainInfo()
 	return p.builder.Endorse(inv, endorsement.ExecutionResult{
-		Status: 200,
-		Payload: protoutil.MarshalOrPanic(&common.BlockchainInfo{
-			Height:            height,
-			CurrentBlockHash:  currentHash,
-			PreviousBlockHash: previousHash,
-		}),
+		Status:  200,
+		Payload: protoutil.MarshalOrPanic(p.ledger.chainInfo()),
 	})
 }
 
@@ -161,27 +162,7 @@ func (p *testPeer) ProcessProposal(ctx context.Context, prop *peer.SignedProposa
 
 // GetBlockchainInfo implements the Fabric-X SidecarService for getting blockchain height
 func (p *testPeer) GetBlockchainInfo(ctx context.Context, _ *emptypb.Empty) (*common.BlockchainInfo, error) {
-	height, currentHash, previousHash := p.ledger.chainInfo()
-	return &common.BlockchainInfo{
-		Height:            height,
-		CurrentBlockHash:  currentHash,
-		PreviousBlockHash: previousHash,
-	}, nil
-}
-
-// GetBlockByNumber implements the Fabric-X SidecarService for getting a specific block
-func (p *testPeer) GetBlockByNumber(ctx context.Context, req *committerpb.BlockNumber) (*common.Block, error) {
-	return nil, errors.New("GetBlockByNumber not implemented in fabrictest")
-}
-
-// GetBlockByTxID implements the Fabric-X SidecarService for getting a block by transaction ID
-func (p *testPeer) GetBlockByTxID(ctx context.Context, req *committerpb.TxID) (*common.Block, error) {
-	return nil, errors.New("GetBlockByTxID not implemented in fabrictest")
-}
-
-// GetTxByID implements the Fabric-X SidecarService for getting a transaction by ID
-func (p *testPeer) GetTxByID(ctx context.Context, req *committerpb.TxID) (*common.Envelope, error) {
-	return nil, errors.New("GetTxByID not implemented in fabrictest")
+	return p.ledger.chainInfo(), nil
 }
 
 // StreamBlocks implements the Fabric-X SidecarService's block feed: it streams a
@@ -195,7 +176,7 @@ func (p *testPeer) GetTxByID(ctx context.Context, req *committerpb.TxID) (*commo
 // (classic) fabrictest network use a different channel header type and are
 // naturally skipped rather than misinterpreted.
 func (p *testPeer) StreamBlocks(req *committerpb.StreamBlocksRequest, stream committerpb.SidecarService_StreamBlocksServer) error {
-	_, sub := p.ledger.subscribe()
+	_, _, sub := p.ledger.subscribe()
 
 	for block := range sub {
 		if err := stream.Send(buildBlockEvent(block, req)); err != nil {
@@ -296,9 +277,3 @@ func filterNamespaces(all []*applicationpb.TxNamespace, filter []string) ([]*app
 	}
 	return matching, len(matching) > 0
 }
-
-// testSigner is a minimal sdk.Signer that returns fixed bytes.
-type testSigner struct{}
-
-func (testSigner) Sign(_ []byte) ([]byte, error) { return []byte("sig"), nil }
-func (testSigner) Serialize() ([]byte, error)    { return []byte("identity"), nil }

@@ -20,12 +20,12 @@ import (
 )
 
 func TestCutBlock_AdvancesHeightAndProducesEmptyBlock(t *testing.T) {
-	n, err := Start(t.Context(), "basic", "fabric-x", Config{}, nil)
+	n, err := Start(t.Context(), "fabric-x", Config{})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
-	_, newBlocks := n.ledger.subscribe()
+	_, _, newBlocks := n.ledger.subscribe()
 	initialHeight := n.ledger.height()
 
 	if err := n.CutBlock(t.Context()); err != nil {
@@ -53,7 +53,7 @@ func TestCutBlock_AdvancesHeightAndProducesEmptyBlock(t *testing.T) {
 // at the network concurrently (run with -race) to verify CutBlock doesn't race
 // with testOrderer.batchingLoop over block numbering or world-state writes.
 func TestCutBlock_ConcurrentWithBroadcast(t *testing.T) {
-	n, err := Start(t.Context(), "basic", "fabric-x", Config{}, nil)
+	n, err := Start(t.Context(), "fabric-x", Config{})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
