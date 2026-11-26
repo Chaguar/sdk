@@ -4,7 +4,7 @@ Copyright IBM Corp. All Rights Reserved.
 SPDX-License-Identifier: Apache-2.0
 */
 
-package storage
+package pebble
 
 import (
 	"context"
@@ -12,17 +12,19 @@ import (
 	"sync"
 	"testing"
 
+	sdk "github.com/hyperledger/fabric-x-sdk"
+
 	"github.com/hyperledger/fabric-x-sdk/blocks"
 )
 
 // countPrefix returns how many keys the store holds under prefix.
-func countPrefix(t *testing.T, kvs *PebbleKVS, prefix byte) int {
+func countPrefix(t *testing.T, kvs *KVS, prefix byte) int {
 	t.Helper()
 	it, err := kvs.newIter([]byte{prefix}, nil)
 	if err != nil {
 		t.Fatalf("iterate prefix %q: %v", prefix, err)
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 
 	n := 0
 	for valid := it.First(); valid; valid = it.Next() {
@@ -35,7 +37,7 @@ func countPrefix(t *testing.T, kvs *PebbleKVS, prefix byte) int {
 }
 
 // writeBlock commits one block holding a single write of "v<block>" to ns1/k.
-func writeBlock(t *testing.T, kvs *PebbleKVS, block uint64) {
+func writeBlock(t *testing.T, kvs *KVS, block uint64) {
 	t.Helper()
 	if err := kvs.Handle(context.Background(), mkBlock(block, 0, fmt.Sprintf("tx%d", block), true, "ns1",
 		blocks.KVWrite{Key: "k", Value: fmt.Appendf(nil, "v%d", block)})); err != nil {
@@ -51,11 +53,11 @@ func TestPebbleHistoryWindowReads(t *testing.T) {
 		window    = 4
 		numBlocks = 10
 	)
-	kvs, err := NewPebbleKVS(t.TempDir(), window)
+	kvs, err := Open(t.TempDir(), window, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	// One write per block, so block i holds value "vi".
 	for i := uint64(1); i <= numBlocks; i++ {
@@ -86,11 +88,11 @@ func TestPebbleHistoryPruneBoundsGrowth(t *testing.T) {
 		numKeys  = 5
 		rewrites = 40
 	)
-	kvs, err := NewPebbleKVS(t.TempDir(), window)
+	kvs, err := Open(t.TempDir(), window, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	for r := uint64(1); r <= rewrites; r++ {
 		writes := make([]blocks.KVWrite, numKeys)
@@ -122,11 +124,11 @@ func TestPebbleHistoryPruneBoundsGrowth(t *testing.T) {
 // block. Records are overwritten in place, so a snapshot that only point-read the
 // current record would observe the later write.
 func TestPebbleSnapshotIsolation(t *testing.T) {
-	kvs, err := NewPebbleKVS(t.TempDir(), 128)
+	kvs, err := Open(t.TempDir(), 128, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	writeBlock(t, kvs, 1)
 
@@ -134,7 +136,7 @@ func TestPebbleSnapshotIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SnapshotAt: %v", err)
 	}
-	defer snap.Close()
+	defer func() { _ = snap.Close() }()
 
 	if rec, err := snap.Get("ns1", "k"); err != nil {
 		t.Fatalf("first Get: %v", err)
@@ -161,11 +163,11 @@ func TestPebbleSnapshotIsolation(t *testing.T) {
 // the block that superseded it, so every height between the two must resolve to
 // it — and heights before the key existed must read as absent.
 func TestPebbleHistoryReadsAcrossGaps(t *testing.T) {
-	kvs, err := NewPebbleKVS(t.TempDir(), 128)
+	kvs, err := Open(t.TempDir(), 128, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	writeBlock(t, kvs, 5)  // "v5" stands until block 40 replaces it
 	writeBlock(t, kvs, 40) // supersedes it, retaining the block-5 record
@@ -188,11 +190,11 @@ func TestPebbleHistoryReadsAcrossGaps(t *testing.T) {
 // the block's own height must resolve to it while the height below resolves to
 // what the block superseded.
 func TestPebbleHistoryAcrossMultiWriteBlock(t *testing.T) {
-	kvs, err := NewPebbleKVS(t.TempDir(), 128)
+	kvs, err := Open(t.TempDir(), 128, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	writeBlock(t, kvs, 1) // "v1"
 	mustHandle(t, kvs, mkMultiTxBlock(2, "ns1",
@@ -207,15 +209,15 @@ func TestPebbleHistoryAcrossMultiWriteBlock(t *testing.T) {
 	wantValue(t, mustGetAsOf(t, kvs, "ns1", "k", 3), "v3")
 }
 
-// TestPebbleFutureHeightServesTip asks for a height past the tip, which LightKVS
-// serves from its current snapshot. The view must be pinned to the tip, not to the
+// TestPebbleFutureHeightServesTip asks for a height past the tip, which is served
+// from the tip. The view must be pinned to the tip, not to the
 // height asked for, or commits made after it was taken leak into it.
 func TestPebbleFutureHeightServesTip(t *testing.T) {
-	kvs, err := NewPebbleKVS(t.TempDir(), 128)
+	kvs, err := Open(t.TempDir(), 128, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	writeBlock(t, kvs, 1)
 
@@ -223,7 +225,7 @@ func TestPebbleFutureHeightServesTip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SnapshotAt(100): %v", err)
 	}
-	defer snap.Close()
+	defer func() { _ = snap.Close() }()
 
 	writeBlock(t, kvs, 2)
 
@@ -242,7 +244,7 @@ func TestPebbleFutureHeightServesTip(t *testing.T) {
 func TestPebbleWindowBoundSurvivesLargerHistorySize(t *testing.T) {
 	dir := t.TempDir()
 
-	kvs, err := NewPebbleKVS(dir, 2)
+	kvs, err := Open(dir, 2, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -253,11 +255,11 @@ func TestPebbleWindowBoundSurvivesLargerHistorySize(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	reopened, err := NewPebbleKVS(dir, 100) // much larger window than was in force
+	reopened, err := Open(dir, 100, sdk.NewTestLogger(t, "pebble")) // much larger window than was in force
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer reopened.Close()
+	defer func() { _ = reopened.Close() }()
 
 	if _, err := reopened.SnapshotAt(t.Context(), 3); err == nil {
 		t.Error("expected SnapshotAt(3) to fail: its versions were pruned under the smaller window")
@@ -268,11 +270,11 @@ func TestPebbleWindowBoundSurvivesLargerHistorySize(t *testing.T) {
 // Block numbers are not guaranteed contiguous, and a gap must not leak entries.
 func TestPebblePruneHandlesBlockGaps(t *testing.T) {
 	const window = 3
-	kvs, err := NewPebbleKVS(t.TempDir(), window)
+	kvs, err := Open(t.TempDir(), window, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	for _, b := range []uint64{1, 2, 3, 50, 51, 52} {
 		writeBlock(t, kvs, b)
@@ -293,11 +295,11 @@ func TestPebblePruneHandlesBlockGaps(t *testing.T) {
 // reader for a whole simulation.
 func TestPebbleSnapshotSurvivesPrune(t *testing.T) {
 	const window = 2 // the production default
-	kvs, err := NewPebbleKVS(t.TempDir(), window)
+	kvs, err := Open(t.TempDir(), window, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	writeBlock(t, kvs, 1)
 
@@ -305,7 +307,7 @@ func TestPebbleSnapshotSurvivesPrune(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SnapshotAt: %v", err)
 	}
-	defer snap.Close()
+	defer func() { _ = snap.Close() }()
 
 	// Commit well past the window while the reader is open.
 	for i := uint64(2); i <= 8; i++ {
@@ -326,11 +328,11 @@ func TestPebbleSnapshotSurvivesPrune(t *testing.T) {
 // resume once that one closes.
 func TestPebbleLowestReaderPinHoldsHistory(t *testing.T) {
 	const window = 2
-	kvs, err := NewPebbleKVS(t.TempDir(), window)
+	kvs, err := Open(t.TempDir(), window, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	writeBlock(t, kvs, 1)
 	older, err := kvs.Snapshot(t.Context()) // pinned at 1
@@ -392,7 +394,7 @@ func TestPebbleLowestReaderPinHoldsHistory(t *testing.T) {
 func TestPebbleOldestMarkerIsMonotonic(t *testing.T) {
 	dir := t.TempDir()
 
-	kvs, err := NewPebbleKVS(dir, 2)
+	kvs, err := Open(dir, 2, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -403,11 +405,11 @@ func TestPebbleOldestMarkerIsMonotonic(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	reopened, err := NewPebbleKVS(dir, 100)
+	reopened, err := Open(dir, 100, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	defer reopened.Close()
+	defer func() { _ = reopened.Close() }()
 
 	// Keep committing under the larger window, which lowers the computed cutoff.
 	for i := uint64(11); i <= 20; i++ {
@@ -419,16 +421,15 @@ func TestPebbleOldestMarkerIsMonotonic(t *testing.T) {
 	}
 }
 
-// TestPebbleWindowWidthMatchesLightKVS checks the retained range is
-// [head-historySize, head], matching LightKVS. historySize=1 is used by several
-// integration configs and must still serve head-1.
-func TestPebbleWindowWidthMatchesLightKVS(t *testing.T) {
+// TestPebbleWindowWidth checks the retained range is [head-historySize, head]:
+// historySize=1 must still serve head-1.
+func TestPebbleWindowWidth(t *testing.T) {
 	const window = 1
-	kvs, err := NewPebbleKVS(t.TempDir(), window)
+	kvs, err := Open(t.TempDir(), window, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	for i := uint64(1); i <= 5; i++ {
 		writeBlock(t, kvs, i)
@@ -442,11 +443,11 @@ func TestPebbleWindowWidthMatchesLightKVS(t *testing.T) {
 // pinned at the same height: the pin must be released exactly once.
 func TestPebbleDoubleCloseKeepsOtherPin(t *testing.T) {
 	const window = 2
-	kvs, err := NewPebbleKVS(t.TempDir(), window)
+	kvs, err := Open(t.TempDir(), window, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	writeBlock(t, kvs, 1)
 
@@ -458,7 +459,7 @@ func TestPebbleDoubleCloseKeepsOtherPin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SnapshotAt survivor: %v", err)
 	}
-	defer survivor.Close()
+	defer func() { _ = survivor.Close() }()
 
 	if err := first.Close(); err != nil {
 		t.Fatalf("close first: %v", err)
@@ -487,11 +488,11 @@ func TestPebbleConcurrentReadersDuringCommits(t *testing.T) {
 		numBlocks = 60
 		readers   = 8
 	)
-	kvs, err := NewPebbleKVS(t.TempDir(), window)
+	kvs, err := Open(t.TempDir(), window, sdk.NewTestLogger(t, "pebble"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer kvs.Close()
+	defer func() { _ = kvs.Close() }()
 
 	writeBlock(t, kvs, 1)
 
